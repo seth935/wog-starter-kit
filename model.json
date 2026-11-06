@@ -1,0 +1,31 @@
+{
+  "$schema": "https://weightsofgiants.com/schema/model-v1.json",
+  "name": "wog-baseline-cortex-a53",
+  "version": "1.0.0",
+  "target_hardware": "cortex-a53-512mb",
+  "runtime": "onnxruntime",
+  "threads": 4,
+  "domains": ["indoor", "urban", "rural"],
+  "frame_policy": {
+    "skip": 0,
+    "resize": "letterbox"
+  },
+  "stages": [
+    {
+      "type": "detector",
+      "model": "models/detector_int8.onnx",
+      "input_size": [512, 512],
+      "conf_threshold": 0.35,
+      "iou_threshold": 0.45
+    },
+    {
+      "type": "tracker",
+      "algo": "bytetrack-lite",
+      "params": {
+        "track_thresh": 0.4,
+        "track_buffer": 30,
+        "match_thresh": 0.8
+      }
+    }
+  ]
+}
