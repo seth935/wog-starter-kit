@@ -1,0 +1,31 @@
+{
+  "$schema": "https://weightsofgiants.com/schema/model-v1.json",
+  "name": "wog-edge-fast-320",
+  "version": "1.0.0",
+  "target_hardware": "la-frite-1gb",
+  "runtime": "onnxruntime",
+  "threads": 4,
+  "domains": ["indoor", "urban", "rural"],
+  "frame_policy": {
+    "skip": 0,
+    "resize": "letterbox"
+  },
+  "stages": [
+    {
+      "type": "detector",
+      "model": "models/detector_int8.onnx",
+      "input_size": [320, 320],
+      "conf_threshold": 0.30,
+      "iou_threshold": 0.45
+    },
+    {
+      "type": "tracker",
+      "algo": "bytetrack-lite",
+      "params": {
+        "track_thresh": 0.35,
+        "track_buffer": 6,
+        "match_thresh": 0.80
+      }
+    }
+  ]
+}

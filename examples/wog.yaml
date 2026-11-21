@@ -1,0 +1,25 @@
+# Alternative YAML manifest (place at repository root as `wog.yaml` instead of `model.json`).
+name: wog-edge-yaml-example
+version: "1.0.0"
+target_hardware: la-frite-1gb
+runtime: onnxruntime
+threads: 4
+domains:
+  - indoor
+  - urban
+  - rural
+frame_policy:
+  skip: 0
+  resize: letterbox
+stages:
+  - type: detector
+    model: models/detector.onnx
+    input_size: [320, 320]
+    conf_threshold: 0.30
+    iou_threshold: 0.45
+  - type: tracker
+    algo: bytetrack-lite
+    params:
+      track_thresh: 0.35
+      track_buffer: 6
+      match_thresh: 0.80

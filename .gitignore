@@ -1,0 +1,24 @@
+# Never commit unsafe deserialization checkpoints or raw training data to a WOG submission repo.
+# The arena security scanner rejects .pt, .pth, .pkl, .pickle, .joblib, and .bin files.
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.joblib
+*.bin
+*.ckpt
+
+# Local training & scratch directories
+work/
+runs/
+datasets/
+*.onnx.data
+
+# Local previews and Python caches
+preview*.jpg
+preview*.png
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/

@@ -1,0 +1,18 @@
+{
+  "test_id": "dev_crosswalk_sample_01",
+  "kind": "dev_sample",
+  "in_official_test_suite": false,
+  "domain": "urban",
+  "geometry": "obb",
+  "fps": 3.75,
+  "frame_size": [
+    480,
+    320
+  ],
+  "num_frames": 25,
+  "source_url": "https://raw.githubusercontent.com/DeGirum/PySDKExamples/main/images/pedestrian.mp4",
+  "source_license": "MIT",
+  "label_provenance": "machine-generated (Dual-Teacher RT-DETR-R101 + MaskRCNN-R50-FPN-v2 OBB, max_gap=0)",
+  "description": "Public 25-frame @ 3.75 FPS urban crosswalk dev clip (pedestrians + vehicles) for local pre-submission scoring. NOT included in the official Season Zero evaluation suite.",
+  "ignore_regions": []
+}

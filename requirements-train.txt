@@ -1,0 +1,10 @@
+# Core local verification & ONNX wrapping (required for verify_local.py & export_onnx.py --mode wrap-onnx)
+numpy>=1.24
+onnxruntime>=1.18
+onnx>=1.15
+opencv-python-headless>=4.8
+pyyaml>=6.0
+
+# Optional: uncomment to train/export Ultralytics YOLO / YOLO-OBB models with train.py
+# ultralytics>=8.3
+# torch>=2.2

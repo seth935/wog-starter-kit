@@ -1,8 +1,8 @@
 {
   "$schema": "https://weightsofgiants.com/schema/model-v1.json",
-  "name": "wog-baseline-cortex-a53",
+  "name": "wog-baseline-la-frite",
   "version": "1.0.0",
-  "target_hardware": "cortex-a53-512mb",
+  "target_hardware": "la-frite-1gb",
   "runtime": "onnxruntime",
   "threads": 4,
   "domains": ["indoor", "urban", "rural"],
@@ -14,7 +14,7 @@
     {
       "type": "detector",
       "model": "models/detector_int8.onnx",
-      "input_size": [512, 512],
+      "input_size": [320, 320],
       "conf_threshold": 0.35,
       "iou_threshold": 0.45
     },
@@ -22,8 +22,8 @@
       "type": "tracker",
       "algo": "bytetrack-lite",
       "params": {
-        "track_thresh": 0.4,
-        "track_buffer": 30,
+        "track_thresh": 0.35,
+        "track_buffer": 6,
         "match_thresh": 0.8
       }
     }
