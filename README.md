@@ -73,14 +73,14 @@ The referee streams unmodified `480×320` RGB surveillance frames sampled at **`
 
 > **Do NOT submit raw `[1, 3549, 85]` or `[1, 84, 2100]` ONNX exports directly.** Always wrap them with `export_onnx.py` so the ONNX graph outputs `[1, K, 7]` directly.
 
-### Eligibility Gates & Scoring Weights (`wog-cv-v2.1`)
+### Eligibility Gates & Scoring Weights (`wog-cv-v2.1` · calibrated on labels `gt-r4`)
 | Metric | Eligibility Floor / Cap | Full-Credit Bar | Pillar Weight |
 |---|---|---|---:|
-| **Detection (`mAP@50:95` above `conf_threshold`)** | `>= 25.0%` per domain | `100%` | **35%** |
-| **Tracking (native HOTA)** | `>= 30.0%` per domain (`>= 50%` Genesis Lineage) | `100%` | **30%** |
-| **Sustained Throughput (`>= 300 s` load, `skip: 0`)** | `>= 2.4 FPS` per domain | `>= 10.0 FPS` | **20%** |
-| **Peak RAM (La Frite 1 GB)** | `<= 800 MB` | `<= 205 MB` | **10%** |
+| **Detection (`mAP@50:95` above `conf_threshold`)** | `>= 25.0%` per domain | `100%` | **40%** |
+| **Tracking (native HOTA)** | `>= 30.0%` per domain (`>= 50%` Champion) | `100%` | **30%** |
+| **Sustained Throughput (`>= 300 s` load, `skip: 0`)** | `>= 2.4 FPS` per domain | `>= 10.0 FPS` | **25%** |
 | **Robustness (11 stress passes + blank canary)** | No separate floor *(Policy B: `0` if clean mAP `< 5%`)* | `100%` | **5%** |
+| **Peak RAM (La Frite 1 GB)** | `<= 800 MB` *(hard safety gate)* | — *(0% weight in Season Zero; Python/ORT shim baseline ~273 MB)* | **0%** |
 | **Per-Domain Composite Score** | **`>= 35.0 / 100`** per domain | `100` | — |
 | **Artifact Size & ONNX Ceiling** | `<= 40 MB`, `IR <= 10`, `opset <= 22` | — | — |
 

@@ -14,8 +14,8 @@ Checks:
    output shape (`[1, N, 6|7|8]`), and numeric range validation (no NaN/Inf, normalized `[0,1]` boxes,
    `theta` in radians, `conf` in `[0,1]`, `cls` in `{0, 1}`).
 5. Optional `--image` + `--save-preview` visual check on a real image.
-6. Note: Peak RAM (`<= 800 MB`, full credit `<= 205 MB`) and official FPS (`>= 2.4 FPS`,
-   full credit `>= 10.0 FPS`) are measured only on the physical La Frite Cortex-A53 board.
+6. Note: Peak RAM (`<= 800 MB` hard safety gate; 0% composite weight in Season Zero) and
+   official FPS (`>= 2.4 FPS`, full credit `>= 10.0 FPS`) are measured only on the physical La Frite Cortex-A53 board.
 """
 
 from __future__ import annotations
