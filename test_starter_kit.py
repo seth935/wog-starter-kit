@@ -205,6 +205,71 @@ class TestStarterKit(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertAlmostEqual(kept[0]["conf"], 0.90, places=3)
 
+    def test_wrap_yolox_coco80_multiplies_obj_and_cls_scores(self) -> None:
+        # YOLOX layout: [1, N, 85] = [cx, cy, w, h, obj_conf, cls_0..cls_79]
+        raw = np.zeros((1, 10, 85), dtype=np.float32)
+        # Anchor 2: dog (COCO cls 16 -> ignored!) with obj=0.99, cls=0.99
+        raw[0, 2, 0:4] = [100.0, 100.0, 50.0, 50.0]
+        raw[0, 2, 4] = 0.99
+        raw[0, 2, 5 + 16] = 0.99
+        # Anchor 5: car (COCO cls 2 -> vehicle=1) with obj=0.80, cls=0.90 => conf=0.72
+        raw[0, 5, 0:4] = [208.0, 104.0, 83.2, 41.6]
+        raw[0, 5, 4] = 0.80
+        raw[0, 5, 5 + 2] = 0.90
+        # Anchor 8: person (COCO cls 0 -> person=0) with obj=0.50, cls=0.80 => conf=0.40
+        raw[0, 8, 0:4] = [104.0, 208.0, 41.6, 83.2]
+        raw[0, 8, 4] = 0.50
+        raw[0, 8, 5 + 0] = 0.80
+
+        raw_p = self.tmp / "raw_yolox.onnx"
+        out_p = self.tmp / "wrapped_yolox.onnx"
+        _build_dummy_raw_yolo_onnx(raw_p, raw, imgsz=416, opset=17)
+
+        export_onnx.wrap_yolox_onnx(raw_p, out_p, imgsz=416, coco_remap=True, top_k=4)
+        sess = ort.InferenceSession(str(out_p), providers=["CPUExecutionProvider"])
+        dets = sess.run(None, {"images": np.zeros((1, 3, 416, 416), dtype=np.float32)})[0]
+        self.assertEqual(dets.shape, (1, 4, 7))
+        np.testing.assert_allclose(dets[0, 0, :4], [0.5, 0.25, 0.2, 0.1], atol=1e-3)
+        self.assertAlmostEqual(float(dets[0, 0, 5]), 0.72, places=4)
+        self.assertEqual(int(round(float(dets[0, 0, 6]))), 1)
+        self.assertAlmostEqual(float(dets[0, 1, 5]), 0.40, places=4)
+        self.assertEqual(int(round(float(dets[0, 1, 6]))), 0)
+        self.assertLess(float(dets[0, 2, 5]), 1e-4)
+
+    def test_train_prepare_coco_json(self) -> None:
+        src_json = self.tmp / "instances_sample.json"
+        dst_json = self.tmp / "wog_2class.json"
+        src_json.write_text(
+            json.dumps(
+                {
+                    "images": [{"id": 1, "file_name": "a.jpg"}, {"id": 2, "file_name": "b.jpg"}],
+                    "annotations": [
+                        {"id": 10, "image_id": 1, "category_id": 1, "bbox": [1, 2, 10, 20]},  # person -> 1
+                        {"id": 11, "image_id": 1, "category_id": 3, "bbox": [5, 6, 30, 15]},  # car -> 2
+                        {"id": 12, "image_id": 2, "category_id": 18, "bbox": [2, 2, 8, 8]},  # dog -> dropped
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        counts = train.prepare_coco_json(src_json, dst_json)
+        self.assertEqual(counts, {"images": 1, "person": 1, "vehicle": 1})
+        out = json.loads(dst_json.read_text(encoding="utf-8"))
+        self.assertEqual([c["name"] for c in out["categories"]], ["person", "vehicle"])
+        self.assertEqual([a["category_id"] for a in out["annotations"]], [1, 2])
+
+    def test_verify_local_rejects_copyleft_license_and_accepts_apache(self) -> None:
+        repo = self.tmp / "lic_repo"
+        (repo / "models").mkdir(parents=True)
+        shutil.copy(STARTER_DIR / "model.json", repo / "model.json")
+        shutil.copy(STARTER_DIR / "models" / "detector_int8.onnx", repo / "models" / "detector_int8.onnx")
+
+        (repo / "LICENSE").write_text("GNU AFFERO GENERAL PUBLIC LICENSE\nVersion 3\n", encoding="utf-8")
+        self.assertFalse(verify_local.verify_repo(str(repo)))
+
+        (repo / "LICENSE").write_text("Apache License\nVersion 2.0, January 2004\n", encoding="utf-8")
+        self.assertTrue(verify_local.verify_repo(str(repo)))
+
 
 if __name__ == "__main__":
     unittest.main()

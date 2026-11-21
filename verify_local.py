@@ -486,14 +486,37 @@ def verify_repo(repo_dir: str = ".", image_path: str | None = None, save_preview
             save_preview=save_preview,
         )
 
-    # Check for open-source LICENSE file (and warn about Ultralytics AGPL-3.0 obligations)
-    has_license = any((root / name).is_file() for name in ("LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING"))
-    if not has_license:
+    # Check for permissive open-source LICENSE file (reject copyleft/non-commercial locally)
+    license_file = next(
+        ((root / name) for name in ("LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING") if (root / name).is_file()),
+        None,
+    )
+    if license_file is None:
         warnings.append(
-            "No LICENSE file found at repo root. Add an approved SPDX license before submitting "
-            "(IMPORTANT: any model trained/exported from Ultralytics YOLO11/YOLOv8 MUST be licensed AGPL-3.0; "
-            "for Apache-2.0/MIT start from YOLOX, NanoDet-Plus, or PP-PicoDet)."
+            "No LICENSE file found at repo root. Add a permissive SPDX LICENSE before submitting "
+            "(Apache-2.0, MIT, BSD-2/3-Clause, ISC, 0BSD, Unlicense, CC0-1.0, Zlib, BSL-1.0, or CC-BY-4.0). "
+            "Copyleft licenses (AGPL/GPL/LGPL/MPL/EPL/CC-BY-SA) and Ultralytics YOLO derivatives are not accepted."
         )
+    else:
+        lic_text = license_file.read_text(encoding="utf-8", errors="ignore").lower()
+        disallowed_markers = (
+            ("gnu affero general public license", "AGPL"),
+            ("gnu general public license", "GPL"),
+            ("gnu lesser general public license", "LGPL"),
+            ("mozilla public license", "MPL"),
+            ("eclipse public license", "EPL"),
+            ("attribution-sharealike", "CC-BY-SA"),
+            ("attribution-noncommercial", "CC-BY-NC"),
+            ("attribution-noderivatives", "CC-BY-ND"),
+        )
+        for marker, label in disallowed_markers:
+            if marker in lic_text:
+                failures.append(
+                    f"Disallowed license detected in {license_file.name} ({label}). "
+                    "Season Zero accepts permissive open-source licenses only (Apache-2.0, MIT, BSD, ISC, 0BSD, "
+                    "Unlicense, CC0-1.0, Zlib, BSL-1.0, CC-BY-4.0) — copyleft and non-commercial licenses are blocked."
+                )
+                break
 
     print("\nMeasured La Frite Cortex-A53 Reference Speeds (for sizing your model vs. 2.4 FPS floor):")
     print("  NanoDet-Plus-m  (320x320,  4.58 MB): 4.68 FPS · 276.5 MB RAM · 48.61% mAP · 43.20% HOTA")

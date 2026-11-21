@@ -1,13 +1,14 @@
-"""Weights of Giants — ONNX Contract Exporter & Wrapper (wog-cv-v2.1).
+"""Weights of Giants — Permissive ONNX Contract Wrapper (wog-cv-v2.1).
 
-LICENSE NOTICE:
-  - Models exported from Ultralytics YOLO11 / YOLOv8 checkpoints are covered by AGPL-3.0
-    (accepted by Season Zero). License your submission repo AGPL-3.0 — not Apache-2.0/MIT.
-  - For Apache-2.0 / MIT submissions, start from Apache-2.0 architectures (YOLOX, NanoDet-Plus,
-    PP-PicoDet) and wrap their ONNX outputs with `--mode wrap-onnx`.
+LICENSE POLICY (Permissive Open-Source Only):
+  Season Zero accepts permissive SPDX licenses ONLY (Apache-2.0, MIT, BSD-2/3-Clause,
+  ISC, 0BSD, Unlicense, CC0-1.0, Zlib, BSL-1.0, CC-BY-4.0).
+  Copyleft licenses (AGPL-3.0, GPL, LGPL, MPL-2.0, EPL-2.0, CC-BY-SA) — including
+  Ultralytics YOLO11 / YOLOv8 derivatives — are NOT accepted.
+  Start from permissive architectures such as YOLOX-Nano (Apache-2.0),
+  NanoDet-Plus (Apache-2.0), PP-PicoDet-S (Apache-2.0), or custom PyTorch/TorchVision models.
 
-Wraps a trained Ultralytics YOLO / YOLO-OBB checkpoint (.pt) or raw detection ONNX
-([1, 4+C, N] AABB or [1, 5+C, N] OBB) into the exact La Frite ONNX Runtime contract:
+Wraps a raw detection ONNX into the exact La Frite ONNX Runtime contract:
 
     Input:  images     [1, 3, H, W]  float32, RGB in [0.0, 1.0]
     Output: detections [1, K, 7]     float32, [cx, cy, w, h, theta_rad, conf, cls]
@@ -16,15 +17,20 @@ Wraps a trained Ultralytics YOLO / YOLO-OBB checkpoint (.pt) or raw detection ON
             - conf in [0, 1]
             - cls: 0 = person, 1 = vehicle
 
+Supported input head layouts:
+  1. --mode wrap-yolox  Apache-2.0 Megvii YOLOX raw ONNX [1, N, 5+C]
+                        ([cx, cy, w, h, obj_conf, cls_0..cls_{C-1}], conf = obj_conf * cls_prob)
+  2. --mode wrap-onnx   Channel-first anchor-free raw ONNX [1, 4+C, N] (AABB) or [1, 5+C, N] (OBB)
+
 Examples:
-    # 1. Export + wrap a custom 2-class Ultralytics YOLO or YOLO-OBB checkpoint
-    python export_onnx.py --mode yolo --weights work/runs/wog_exp/weights/best.pt --imgsz 320 --out models/detector.onnx --update-manifest
+    # 1. Wrap a pretrained 80-class Apache-2.0 YOLOX-Nano ONNX (auto-remaps COCO -> person/vehicle)
+    python export_onnx.py --mode wrap-yolox --onnx work/yolox_nano.onnx --imgsz 416 --coco-remap --quantize int8 --out models/detector_int8.onnx --update-manifest
 
-    # 2. Export + wrap a pretrained 80-class COCO YOLO checkpoint (auto-remaps COCO -> 0=person, 1=vehicle)
-    python export_onnx.py --mode yolo --weights work/yolo11n.pt --imgsz 320 --coco-remap --quantize int8 --out models/detector_int8.onnx --update-manifest
+    # 2. Wrap a custom 2-class YOLOX ONNX
+    python export_onnx.py --mode wrap-yolox --onnx work/yolox_2class.onnx --imgsz 320 --num-classes 2 --out models/detector.onnx --update-manifest
 
-    # 3. Wrap an existing raw YOLO-format ONNX ([1, 4+C, N] or [1, 5+C, N]) without PyTorch
-    python export_onnx.py --mode wrap-onnx --onnx work/raw_yolo.onnx --imgsz 320 --num-classes 2 --out models/detector.onnx
+    # 3. Wrap a channel-first [1, 4+C, N] AABB or [1, 5+C, N] OBB raw ONNX
+    python export_onnx.py --mode wrap-onnx --onnx work/raw_detector.onnx --imgsz 320 --num-classes 2 --out models/detector.onnx --update-manifest
 """
 
 from __future__ import annotations
@@ -53,8 +59,8 @@ def _get_main_opset(model: onnx.ModelProto) -> int:
     return 17
 
 
-def _infer_dims(model: onnx.ModelProto, imgsz: int) -> tuple[int, int, int, int]:
-    """Return (in_h, in_w, raw_channels, num_anchors) from static graph metadata or ORT probe."""
+def _infer_3d_dims(model: onnx.ModelProto, imgsz: int) -> tuple[int, int, int, int]:
+    """Return (in_h, in_w, dim1, dim2) from static graph metadata or ORT probe."""
     inp = model.graph.input[0]
     in_dims = [d.dim_value for d in inp.type.tensor_type.shape.dim]
     in_h = int(in_dims[2]) if len(in_dims) >= 4 and in_dims[2] > 0 else int(imgsz)
@@ -62,20 +68,176 @@ def _infer_dims(model: onnx.ModelProto, imgsz: int) -> tuple[int, int, int, int]
 
     out = model.graph.output[0]
     out_dims = [d.dim_value for d in out.type.tensor_type.shape.dim]
-    raw_c = int(out_dims[1]) if len(out_dims) >= 3 and out_dims[1] > 0 else 0
-    raw_n = int(out_dims[2]) if len(out_dims) >= 3 and out_dims[2] > 0 else 0
+    d1 = int(out_dims[1]) if len(out_dims) >= 3 and out_dims[1] > 0 else 0
+    d2 = int(out_dims[2]) if len(out_dims) >= 3 and out_dims[2] > 0 else 0
 
-    if raw_c <= 0 or raw_n <= 0:
+    if d1 <= 0 or d2 <= 0:
         import onnxruntime as ort
 
         sess = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"])
         dummy = np.zeros((1, 3, in_h, in_w), dtype=np.float32)
         probe = sess.run(None, {sess.get_inputs()[0].name: dummy})[0]
         if probe.ndim != 3:
-            raise ValueError(f"Expected 3D raw detector output [1, C, N], got shape {probe.shape}")
-        raw_c, raw_n = int(probe.shape[1]), int(probe.shape[2])
+            raise ValueError(f"Expected 3D raw detector output, got shape {probe.shape}")
+        d1, d2 = int(probe.shape[1]), int(probe.shape[2])
 
-    return in_h, in_w, raw_c, raw_n
+    return in_h, in_w, d1, d2
+
+
+def _finalize_and_save(
+    model: onnx.ModelProto,
+    output_path: str | Path,
+    *,
+    in_h: int,
+    in_w: int,
+    k_val: int,
+    opset: int,
+    has_angle: bool,
+    coco_remap: bool,
+    quantize: str,
+) -> Path:
+    final_out = "detections"
+    del model.graph.output[:]
+    model.graph.output.append(
+        helper.make_tensor_value_info(final_out, TensorProto.FLOAT, [1, k_val, 7])
+    )
+    if model.ir_version > 10:
+        model.ir_version = 10
+
+    onnx.checker.check_model(model)
+
+    out_path = Path(output_path).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if quantize == "int8":
+        from onnxruntime.quantization import QuantType, quantize_dynamic
+
+        with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tf:
+            fp32_tmp = Path(tf.name)
+        try:
+            onnx.save(model, str(fp32_tmp))
+            quantize_dynamic(
+                model_input=str(fp32_tmp),
+                model_output=str(out_path),
+                weight_type=QuantType.QUInt8,
+            )
+        finally:
+            if fp32_tmp.exists():
+                fp32_tmp.unlink()
+    elif quantize == "none":
+        onnx.save(model, str(out_path))
+    else:
+        raise ValueError(f"Unsupported --quantize={quantize!r}; choose 'none' or 'int8'.")
+
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(str(out_path), providers=["CPUExecutionProvider"])
+    dummy = np.zeros((1, 3, in_h, in_w), dtype=np.float32)
+    out_arr = sess.run(None, {sess.get_inputs()[0].name: dummy})[0]
+    if out_arr.shape != (1, k_val, 7):
+        raise RuntimeError(f"Wrapped ONNX output shape mismatch: {out_arr.shape} != {(1, k_val, 7)}")
+
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    print(f"[+] Exported WOG ONNX: {out_path}")
+    print(f"    Input:   {sess.get_inputs()[0].name} [1, 3, {in_h}, {in_w}] float32 RGB [0, 1]")
+    print(f"    Output:  {final_out} [1, {k_val}, 7] float32 [cx, cy, w, h, theta_rad, conf, cls]")
+    print(f"    Mode:    obb={has_angle}, coco_remap={coco_remap}, quantize={quantize}")
+    print(f"    Size:    {size_mb:.2f} MB (limit <= 40.0 MB), IR={model.ir_version}, opset={opset}")
+    return out_path
+
+
+def _make_graph_helpers(opset: int, prefix: str = "__wog_wrap_"):
+    inits: list[onnx.TensorProto] = []
+    nodes: list[onnx.NodeProto] = []
+
+    def add_init(name: str, arr: np.ndarray) -> str:
+        full = prefix + name
+        inits.append(numpy_helper.from_array(arr, name=full))
+        return full
+
+    def make_slice(data: str, start: int, end: int, axis: int, out_name: str) -> str:
+        s_t = add_init(f"{out_name}_starts", np.array([start], dtype=np.int64))
+        e_t = add_init(f"{out_name}_ends", np.array([end], dtype=np.int64))
+        a_t = add_init(f"{out_name}_axes", np.array([axis], dtype=np.int64))
+        dst = prefix + out_name
+        nodes.append(helper.make_node("Slice", [data, s_t, e_t, a_t], [dst]))
+        return dst
+
+    def make_reduce_max(data: str, axis: int, out_name: str) -> str:
+        dst = prefix + out_name
+        if opset >= 18:
+            ax_t = add_init(f"{out_name}_axes", np.array([axis], dtype=np.int64))
+            nodes.append(helper.make_node("ReduceMax", [data, ax_t], [dst], keepdims=1))
+        else:
+            nodes.append(helper.make_node("ReduceMax", [data], [dst], axes=[axis], keepdims=1))
+        return dst
+
+    def make_squeeze(data: str, axis: int, out_name: str) -> str:
+        dst = prefix + out_name
+        if opset >= 13:
+            ax_t = add_init(f"{out_name}_axes", np.array([axis], dtype=np.int64))
+            nodes.append(helper.make_node("Squeeze", [data, ax_t], [dst]))
+        else:
+            nodes.append(helper.make_node("Squeeze", [data], [dst], axes=[axis]))
+        return dst
+
+    return inits, nodes, add_init, make_slice, make_reduce_max, make_squeeze
+
+
+def _append_wog_tail(
+    *,
+    boxes_norm: str,
+    scores_all: str,
+    theta_tensor: str | None,
+    n_cls: int,
+    coco_remap: bool,
+    k_val: int,
+    prefix: str,
+    nodes: list[onnx.NodeProto],
+    add_init,
+    make_reduce_max,
+    make_squeeze,
+) -> None:
+    if coco_remap:
+        idx_p = add_init("coco_person_idx", np.array(COCO_PERSON_INDICES, dtype=np.int64))
+        idx_v = add_init("coco_vehicle_idx", np.array(COCO_VEHICLE_INDICES, dtype=np.int64))
+        sc_p = prefix + "score_person"
+        sc_v_all = prefix + "score_vehicle_all"
+        nodes.append(helper.make_node("Gather", [scores_all, idx_p], [sc_p], axis=2))
+        nodes.append(helper.make_node("Gather", [scores_all, idx_v], [sc_v_all], axis=2))
+        sc_v = make_reduce_max(sc_v_all, 2, "score_vehicle")
+        scores_2c = prefix + "scores_2c"
+        nodes.append(helper.make_node("Concat", [sc_p, sc_v], [scores_2c], axis=2))
+    else:
+        if n_cls != 2:
+            raise ValueError(
+                f"Expected 2 classes (0=person, 1=vehicle) without --coco-remap, got num_classes={n_cls}."
+            )
+        scores_2c = scores_all
+
+    conf = make_reduce_max(scores_2c, 2, "conf")
+    cls_i64 = prefix + "cls_i64"
+    cls_f = prefix + "cls_f"
+    nodes.append(helper.make_node("ArgMax", [scores_2c], [cls_i64], axis=2, keepdims=1))
+    nodes.append(helper.make_node("Cast", [cls_i64], [cls_f], to=TensorProto.FLOAT))
+
+    if theta_tensor is None:
+        zero_s = add_init("zero_scalar", np.array(0.0, dtype=np.float32))
+        theta = prefix + "theta_zero"
+        nodes.append(helper.make_node("Mul", [conf, zero_s], [theta]))
+    else:
+        theta = theta_tensor
+
+    det_all = prefix + "det_all"
+    nodes.append(helper.make_node("Concat", [boxes_norm, theta, conf, cls_f], [det_all], axis=2))
+
+    conf_2d = make_squeeze(conf, 2, "conf_2d")
+    k_t = add_init("topk_k", np.array([k_val], dtype=np.int64))
+    topk_vals = prefix + "topk_vals"
+    topk_idx = prefix + "topk_idx"
+    nodes.append(helper.make_node("TopK", [conf_2d, k_t], [topk_vals, topk_idx], axis=1))
+    topk_idx_1d = make_squeeze(topk_idx, 0, "topk_idx_1d")
+    nodes.append(helper.make_node("Gather", [det_all, topk_idx_1d], ["detections"], axis=1))
 
 
 def wrap_yolo_onnx(
@@ -90,10 +252,10 @@ def wrap_yolo_onnx(
     already_normalized: bool = False,
     quantize: str = "none",
 ) -> Path:
-    """Append an in-graph WOG [1, K, 7] post-processing head to a raw YOLO/YOLO-OBB ONNX."""
+    """Append an in-graph WOG [1, K, 7] head to a channel-first [1, 4+C, N] or [1, 5+C, N] ONNX."""
     model = onnx.load(str(raw_onnx_path))
     opset = _get_main_opset(model)
-    in_h, in_w, raw_c, raw_n = _infer_dims(model, imgsz)
+    in_h, in_w, raw_c, raw_n = _infer_3d_dims(model, imgsz)
 
     if coco_remap:
         n_cls = 80
@@ -133,46 +295,11 @@ def wrap_yolo_onnx(
     k_val = max(1, min(int(top_k), raw_n))
     raw_out_name = model.graph.output[0].name
     p = "__wog_wrap_"
+    inits, nodes, add_init, make_slice, make_reduce_max, make_squeeze = _make_graph_helpers(opset, p)
 
-    inits: list[onnx.TensorProto] = []
-    nodes: list[onnx.NodeProto] = []
-
-    def add_init(name: str, arr: np.ndarray) -> str:
-        full = p + name
-        inits.append(numpy_helper.from_array(arr, name=full))
-        return full
-
-    def make_slice(data: str, start: int, end: int, axis: int, out_name: str) -> str:
-        s_t = add_init(f"{out_name}_starts", np.array([start], dtype=np.int64))
-        e_t = add_init(f"{out_name}_ends", np.array([end], dtype=np.int64))
-        a_t = add_init(f"{out_name}_axes", np.array([axis], dtype=np.int64))
-        dst = p + out_name
-        nodes.append(helper.make_node("Slice", [data, s_t, e_t, a_t], [dst]))
-        return dst
-
-    def make_reduce_max(data: str, axis: int, out_name: str) -> str:
-        dst = p + out_name
-        if opset >= 18:
-            ax_t = add_init(f"{out_name}_axes", np.array([axis], dtype=np.int64))
-            nodes.append(helper.make_node("ReduceMax", [data, ax_t], [dst], keepdims=1))
-        else:
-            nodes.append(helper.make_node("ReduceMax", [data], [dst], axes=[axis], keepdims=1))
-        return dst
-
-    def make_squeeze(data: str, axis: int, out_name: str) -> str:
-        dst = p + out_name
-        if opset >= 13:
-            ax_t = add_init(f"{out_name}_axes", np.array([axis], dtype=np.int64))
-            nodes.append(helper.make_node("Squeeze", [data, ax_t], [dst]))
-        else:
-            nodes.append(helper.make_node("Squeeze", [data], [dst], axes=[axis]))
-        return dst
-
-    # 1. [1, C_total, N] -> [1, N, C_total]
     raw_t = p + "raw_t"
     nodes.append(helper.make_node("Transpose", [raw_out_name], [raw_t], perm=[0, 2, 1]))
 
-    # 2. Boxes [1, N, 4] normalized to [0, 1] relative to [in_w, in_h]
     boxes_raw = make_slice(raw_t, 0, 4, 2, "boxes_raw")
     if already_normalized:
         boxes_norm = boxes_raw
@@ -181,126 +308,119 @@ def wrap_yolo_onnx(
         boxes_norm = p + "boxes_norm"
         nodes.append(helper.make_node("Div", [boxes_raw, scale], [boxes_norm]))
 
-    # 3. Class scores -> 2-class [person, vehicle]
     cls_all = make_slice(raw_t, 4, 4 + n_cls, 2, "cls_all")
-    if coco_remap:
-        idx_p = add_init("coco_person_idx", np.array(COCO_PERSON_INDICES, dtype=np.int64))
-        idx_v = add_init("coco_vehicle_idx", np.array(COCO_VEHICLE_INDICES, dtype=np.int64))
-        sc_p = p + "score_person"
-        sc_v_all = p + "score_vehicle_all"
-        nodes.append(helper.make_node("Gather", [cls_all, idx_p], [sc_p], axis=2))
-        nodes.append(helper.make_node("Gather", [cls_all, idx_v], [sc_v_all], axis=2))
-        sc_v = make_reduce_max(sc_v_all, 2, "score_vehicle")
-        scores_2c = p + "scores_2c"
-        nodes.append(helper.make_node("Concat", [sc_p, sc_v], [scores_2c], axis=2))
-    else:
-        if n_cls != 2:
-            raise ValueError(
-                f"Expected 2 classes (0=person, 1=vehicle) without --coco-remap, got num_classes={n_cls}."
-            )
-        scores_2c = cls_all
+    theta = make_slice(raw_t, 4 + n_cls, 5 + n_cls, 2, "theta_rad") if has_angle else None
 
-    conf = make_reduce_max(scores_2c, 2, "conf")
-    cls_i64 = p + "cls_i64"
-    cls_f = p + "cls_f"
-    nodes.append(helper.make_node("ArgMax", [scores_2c], [cls_i64], axis=2, keepdims=1))
-    nodes.append(helper.make_node("Cast", [cls_i64], [cls_f], to=TensorProto.FLOAT))
-
-    # 4. Angle theta_rad [1, N, 1]
-    if has_angle:
-        theta = make_slice(raw_t, 4 + n_cls, 5 + n_cls, 2, "theta_rad")
-    else:
-        zero_s = add_init("zero_scalar", np.array(0.0, dtype=np.float32))
-        theta = p + "theta_zero"
-        nodes.append(helper.make_node("Mul", [conf, zero_s], [theta]))
-
-    # 5. Concat -> [1, N, 7] = [cx, cy, w, h, theta_rad, conf, cls]
-    det_all = p + "det_all"
-    nodes.append(helper.make_node("Concat", [boxes_norm, theta, conf, cls_f], [det_all], axis=2))
-
-    # 6. Top-K by confidence -> [1, K, 7]
-    conf_2d = make_squeeze(conf, 2, "conf_2d")
-    k_t = add_init("topk_k", np.array([k_val], dtype=np.int64))
-    topk_vals = p + "topk_vals"
-    topk_idx = p + "topk_idx"
-    nodes.append(helper.make_node("TopK", [conf_2d, k_t], [topk_vals, topk_idx], axis=1))
-    topk_idx_1d = make_squeeze(topk_idx, 0, "topk_idx_1d")
-    final_out = "detections"
-    nodes.append(helper.make_node("Gather", [det_all, topk_idx_1d], [final_out], axis=1))
+    _append_wog_tail(
+        boxes_norm=boxes_norm,
+        scores_all=cls_all,
+        theta_tensor=theta,
+        n_cls=n_cls,
+        coco_remap=coco_remap,
+        k_val=k_val,
+        prefix=p,
+        nodes=nodes,
+        add_init=add_init,
+        make_reduce_max=make_reduce_max,
+        make_squeeze=make_squeeze,
+    )
 
     model.graph.initializer.extend(inits)
     model.graph.node.extend(nodes)
-
-    # Replace graph outputs with single WOG contract output
-    del model.graph.output[:]
-    model.graph.output.append(
-        helper.make_tensor_value_info(final_out, TensorProto.FLOAT, [1, k_val, 7])
+    return _finalize_and_save(
+        model,
+        output_path,
+        in_h=in_h,
+        in_w=in_w,
+        k_val=k_val,
+        opset=opset,
+        has_angle=has_angle,
+        coco_remap=coco_remap,
+        quantize=quantize,
     )
-    if model.ir_version > 10:
-        model.ir_version = 10
 
-    onnx.checker.check_model(model)
 
-    out_path = Path(output_path).resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+def wrap_yolox_onnx(
+    raw_onnx_path: str | Path,
+    output_path: str | Path,
+    *,
+    imgsz: int = 416,
+    num_classes: int | None = None,
+    coco_remap: bool = False,
+    top_k: int = 200,
+    already_normalized: bool = False,
+    quantize: str = "none",
+) -> Path:
+    """Append an in-graph WOG [1, K, 7] head to an Apache-2.0 YOLOX [1, N, 5+C] ONNX."""
+    model = onnx.load(str(raw_onnx_path))
+    opset = _get_main_opset(model)
+    in_h, in_w, raw_n, raw_c = _infer_3d_dims(model, imgsz)
 
-    if quantize == "int8":
-        from onnxruntime.quantization import QuantType, quantize_dynamic
-
-        with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tf:
-            fp32_tmp = Path(tf.name)
-        try:
-            onnx.save(model, str(fp32_tmp))
-            quantize_dynamic(
-                model_input=str(fp32_tmp),
-                model_output=str(out_path),
-                weight_type=QuantType.QUInt8,
-            )
-        finally:
-            if fp32_tmp.exists():
-                fp32_tmp.unlink()
-    elif quantize == "none":
-        onnx.save(model, str(out_path))
+    if coco_remap:
+        n_cls = 80
+    elif num_classes is not None:
+        n_cls = int(num_classes)
     else:
-        raise ValueError(f"Unsupported --quantize={quantize!r}; choose 'none' or 'int8'.")
+        if raw_c == 7:
+            n_cls = 2
+        elif raw_c == 85:
+            n_cls = 80
+            coco_remap = True
+        else:
+            raise ValueError(
+                f"Cannot auto-infer YOLOX num_classes from last dim C={raw_c}. "
+                "Pass --num-classes N (expected last dim = 5 + num_classes)."
+            )
 
-    # Smoke-test the saved ONNX via ONNX Runtime
-    import onnxruntime as ort
+    if raw_c != 5 + n_cls:
+        raise ValueError(f"Expected YOLOX last dim 5+C={5 + n_cls}, got {raw_c}.")
 
-    sess = ort.InferenceSession(str(out_path), providers=["CPUExecutionProvider"])
-    dummy = np.zeros((1, 3, in_h, in_w), dtype=np.float32)
-    out_arr = sess.run(None, {sess.get_inputs()[0].name: dummy})[0]
-    if out_arr.shape != (1, k_val, 7):
-        raise RuntimeError(f"Wrapped ONNX output shape mismatch: {out_arr.shape} != {(1, k_val, 7)}")
+    k_val = max(1, min(int(top_k), raw_n))
+    raw_out_name = model.graph.output[0].name
+    p = "__wog_yolox_"
+    inits, nodes, add_init, make_slice, make_reduce_max, make_squeeze = _make_graph_helpers(opset, p)
 
-    size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    print(f"[+] Exported WOG ONNX: {out_path}")
-    print(f"    Input:   {sess.get_inputs()[0].name} [1, 3, {in_h}, {in_w}] float32 RGB [0, 1]")
-    print(f"    Output:  {final_out} [1, {k_val}, 7] float32 [cx, cy, w, h, theta_rad, conf, cls]")
-    print(f"    Mode:    obb={has_angle}, coco_remap={coco_remap}, quantize={quantize}")
-    print(f"    Size:    {size_mb:.2f} MB (limit <= 40.0 MB), IR={model.ir_version}, opset={opset}")
-    return out_path
+    boxes_raw = make_slice(raw_out_name, 0, 4, 2, "boxes_raw")
+    if already_normalized:
+        boxes_norm = boxes_raw
+    else:
+        scale = add_init("wh_scale", np.array([float(in_w), float(in_h), float(in_w), float(in_h)], dtype=np.float32))
+        boxes_norm = p + "boxes_norm"
+        nodes.append(helper.make_node("Div", [boxes_raw, scale], [boxes_norm]))
 
+    # YOLOX final class confidence = obj_conf * cls_prob
+    obj_conf = make_slice(raw_out_name, 4, 5, 2, "obj_conf")
+    cls_raw = make_slice(raw_out_name, 5, 5 + n_cls, 2, "cls_raw")
+    scores_all = p + "scores_all"
+    nodes.append(helper.make_node("Mul", [obj_conf, cls_raw], [scores_all]))
 
-def export_ultralytics_pt(weights_path: str | Path, imgsz: int) -> Path:
-    """Export an Ultralytics YOLO / YOLO-OBB .pt checkpoint to a temporary raw ONNX."""
-    try:
-        from ultralytics import YOLO
-    except ImportError as exc:
-        raise RuntimeError(
-            "Ultralytics is required for --mode yolo. Install with: pip install ultralytics"
-        ) from exc
-
-    model = YOLO(str(weights_path))
-    exported = model.export(
-        format="onnx",
-        imgsz=int(imgsz),
-        opset=17,
-        simplify=False,
-        dynamic=False,
-        nms=False,
+    _append_wog_tail(
+        boxes_norm=boxes_norm,
+        scores_all=scores_all,
+        theta_tensor=None,
+        n_cls=n_cls,
+        coco_remap=coco_remap,
+        k_val=k_val,
+        prefix=p,
+        nodes=nodes,
+        add_init=add_init,
+        make_reduce_max=make_reduce_max,
+        make_squeeze=make_squeeze,
     )
-    return Path(exported).resolve()
+
+    model.graph.initializer.extend(inits)
+    model.graph.node.extend(nodes)
+    return _finalize_and_save(
+        model,
+        output_path,
+        in_h=in_h,
+        in_w=in_w,
+        k_val=k_val,
+        opset=opset,
+        has_angle=False,
+        coco_remap=coco_remap,
+        quantize=quantize,
+    )
 
 
 def _update_manifest(manifest_path: Path, model_rel: str, imgsz: int) -> None:
@@ -318,14 +438,18 @@ def _update_manifest(manifest_path: Path, model_rel: str, imgsz: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Export and wrap a detector into the WOG [1, K, 7] ONNX contract.")
-    ap.add_argument("--mode", choices=("yolo", "wrap-onnx"), required=True)
-    ap.add_argument("--weights", help="Path to Ultralytics .pt checkpoint (for --mode yolo)")
-    ap.add_argument("--onnx", help="Path to existing raw YOLO-format .onnx (for --mode wrap-onnx)")
+    ap = argparse.ArgumentParser(description="Wrap a permissive ONNX detector into the WOG [1, K, 7] contract.")
+    ap.add_argument(
+        "--mode",
+        choices=("wrap-yolox", "wrap-onnx"),
+        required=True,
+        help="wrap-yolox: [1, N, 5+C] Apache-2.0 YOLOX head; wrap-onnx: [1, 4+C, N] AABB or [1, 5+C, N] OBB head",
+    )
+    ap.add_argument("--onnx", required=True, help="Path to existing raw .onnx export")
     ap.add_argument("--imgsz", type=int, default=320, help="Square input size (32-512; recommended 320 or 416)")
     ap.add_argument("--num-classes", type=int, default=None, help="Number of classes in raw head (2 or 80)")
     ap.add_argument("--coco-remap", action="store_true", help="Remap 80-class COCO head -> 0=person, 1=vehicle")
-    ap.add_argument("--obb", action="store_true", default=None, help="Force OBB head (raw has 5+C channels)")
+    ap.add_argument("--obb", action="store_true", default=None, help="Force OBB head for --mode wrap-onnx (5+C channels)")
     ap.add_argument("--top-k", type=int, default=200, help="Top-K detections kept in-graph (default 200)")
     ap.add_argument("--already-normalized", action="store_true", help="Set if raw boxes are already in [0, 1]")
     ap.add_argument("--quantize", choices=("none", "int8"), default="none", help="Optional dynamic INT8 quantization")
@@ -336,18 +460,19 @@ def main(argv: list[str] | None = None) -> int:
     if not 32 <= args.imgsz <= 512:
         raise ValueError(f"--imgsz must be 32..512 for la-frite-1gb, got {args.imgsz}")
 
-    tmp_raw: Path | None = None
-    try:
-        if args.mode == "yolo":
-            if not args.weights:
-                raise ValueError("--weights is required for --mode yolo")
-            tmp_raw = export_ultralytics_pt(args.weights, args.imgsz)
-            raw_path = tmp_raw
-        else:
-            if not args.onnx:
-                raise ValueError("--onnx is required for --mode wrap-onnx")
-            raw_path = Path(args.onnx).resolve()
-
+    raw_path = Path(args.onnx).resolve()
+    if args.mode == "wrap-yolox":
+        out_path = wrap_yolox_onnx(
+            raw_path,
+            args.out,
+            imgsz=args.imgsz,
+            num_classes=args.num_classes,
+            coco_remap=args.coco_remap,
+            top_k=args.top_k,
+            already_normalized=args.already_normalized,
+            quantize=args.quantize,
+        )
+    else:
         out_path = wrap_yolo_onnx(
             raw_path,
             args.out,
@@ -359,12 +484,6 @@ def main(argv: list[str] | None = None) -> int:
             already_normalized=args.already_normalized,
             quantize=args.quantize,
         )
-    finally:
-        if tmp_raw is not None and tmp_raw.exists() and tmp_raw != Path(args.out).resolve():
-            try:
-                tmp_raw.unlink()
-            except OSError:
-                pass
 
     if args.update_manifest:
         repo_root = Path(__file__).resolve().parent

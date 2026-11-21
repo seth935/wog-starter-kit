@@ -1,36 +1,44 @@
-"""Weights of Giants — Season Zero Edge Detector Training & Dataset Helper (wog-cv-v2.1).
+"""Weights of Giants — Season Zero Permissive Dataset Prep Helper (wog-cv-v2.1).
 
-LICENSE NOTICE:
-  - Ultralytics YOLO11 / YOLOv8 weights and fine-tuned checkpoints are covered by AGPL-3.0
-    (which Season Zero accepts!). If you train or export from Ultralytics, your submission
-    repository MUST be licensed AGPL-3.0 — do NOT label it MIT or Apache-2.0.
-  - If you want permissive Apache-2.0 / MIT licensing, train/export from Apache-2.0
-    detectors such as YOLOX-Nano, NanoDet-Plus, or PP-PicoDet-S instead.
+LICENSE POLICY (Permissive Open-Source Only):
+  Season Zero accepts permissive SPDX licenses ONLY (Apache-2.0, MIT, BSD-2/3-Clause,
+  ISC, 0BSD, Unlicense, CC0-1.0, Zlib, BSL-1.0, CC-BY-4.0).
+  Copyleft licenses (AGPL-3.0, GPL, LGPL, MPL-2.0, EPL-2.0, CC-BY-SA) — including
+  Ultralytics YOLO11 / YOLOv8 checkpoints — are NOT accepted.
+
+  Recommended permissive starting detectors:
+    - YOLOX-Nano / YOLOX-Tiny (Apache-2.0): https://github.com/Megvii-BaseDetection/YOLOX
+    - NanoDet-Plus (Apache-2.0):            https://github.com/RangiLyu/nanodet
+    - PP-PicoDet-S (Apache-2.0):            https://github.com/PaddlePaddle/PaddleDetection
+    - TorchVision SSDLite (BSD-3-Clause):   https://pytorch.org/vision
 
 Subcommands:
-  1. prepare-coco   Remap standard 80-class COCO YOLO labels -> 2-class WOG labels
-                    (0=person, 1=vehicle: bicycle/car/motorcycle/bus/truck) and write data.yaml.
-  2. train          Train a lightweight edge detector (Ultralytics YOLO / YOLO-OBB) into
-                    the .gitignored `work/runs/` folder so `.pt` checkpoints never pollute
-                    your submission repository.
+  1. prepare-coco-json  Filter a standard COCO instances_*.json into a 2-class WOG COCO JSON
+                        (1=person, 2=vehicle) ready for YOLOX, NanoDet-Plus, PP-PicoDet, or TorchVision.
+  2. prepare-coco       Remap 80-class YOLO-format .txt labels -> 2-class WOG labels
+                        (0=person, 1=vehicle: bicycle/car/motorcycle/bus/truck) and write data.yaml.
 
 Examples:
-    # Step 1: Remap an existing YOLO-format COCO dataset to 2 WOG classes
-    python train.py prepare-coco --src-labels datasets/coco/labels --dst-labels datasets/wog_2class/labels --images-dir datasets/coco/images --out-yaml datasets/wog_2class/data.yaml
+    # 1. Prepare 2-class COCO JSON for Apache-2.0 YOLOX / NanoDet-Plus / PP-PicoDet
+    python train.py prepare-coco-json \
+      --src-json datasets/coco/annotations/instances_train2017.json \
+      --dst-json datasets/wog_2class/instances_train.json
 
-    # Step 2: Train a lightweight 320x320 detector (stored in work/runs/, never committed)
-    python train.py train --data datasets/wog_2class/data.yaml --model yolo11n.pt --imgsz 320 --epochs 50
-
-    # Step 3: Export & wrap to WOG [1, K, 7] ONNX contract
-    python export_onnx.py --mode yolo --weights work/runs/wog_train/weights/best.pt --imgsz 320 --out models/detector.onnx --update-manifest
+    # 2. Remap YOLO-format .txt labels to 2 WOG classes
+    python train.py prepare-coco \
+      --src-labels datasets/coco/labels \
+      --dst-labels datasets/wog_2class/labels \
+      --images-dir datasets/coco/images \
+      --out-yaml datasets/wog_2class/data.yaml
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
-# COCO 80-class IDs mapped to WOG Season Zero classes:
+# COCO 80-class 0-based IDs -> WOG Season Zero 0-based classes:
 #   0 = person
 #   1 = vehicle (bicycle=1, car=2, motorcycle=3, bus=5, truck=7)
 COCO_TO_WOG: dict[int, int] = {
@@ -40,6 +48,18 @@ COCO_TO_WOG: dict[int, int] = {
     3: 1,  # motorcycle -> vehicle
     5: 1,  # bus -> vehicle
     7: 1,  # truck -> vehicle
+}
+
+# Standard COCO JSON category_id (1-based) -> WOG 2-class COCO JSON category_id:
+#   1 = person (COCO id 1)
+#   2 = vehicle (COCO ids: bicycle=2, car=3, motorcycle=4, bus=6, truck=8)
+COCO_JSON_CAT_TO_WOG: dict[int, int] = {
+    1: 1,  # person
+    2: 2,  # bicycle -> vehicle
+    3: 2,  # car -> vehicle
+    4: 2,  # motorcycle -> vehicle
+    6: 2,  # bus -> vehicle
+    8: 2,  # truck -> vehicle
 }
 
 
@@ -115,97 +135,102 @@ def prepare_coco_labels(
     return {"files": files_written, "person": boxes_person, "vehicle": boxes_vehicle}
 
 
-def run_train(args: argparse.Namespace) -> int:
-    try:
-        from ultralytics import YOLO
-    except ImportError as exc:
-        raise RuntimeError(
-            "Ultralytics is required for training. Install with: pip install ultralytics torch"
-        ) from exc
+def prepare_coco_json(
+    src_json_path: str | Path,
+    dst_json_path: str | Path,
+    *,
+    keep_empty_images: bool = False,
+) -> dict[str, int]:
+    """Filter & remap a standard COCO instances JSON to WOG 2-class (1=person, 2=vehicle).
 
-    data_path = Path(args.data).resolve()
-    if not data_path.is_file():
-        raise FileNotFoundError(f"Dataset YAML not found: {data_path}")
-    if not 32 <= args.imgsz <= 512:
-        raise ValueError(f"--imgsz must be 32..512 for la-frite-1gb, got {args.imgsz}")
+    Output JSON is directly compatible with Apache-2.0 YOLOX, NanoDet-Plus, PP-PicoDet,
+    and BSD-3-Clause TorchVision dataset loaders.
+    """
+    src = Path(src_json_path).resolve()
+    dst = Path(dst_json_path).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"Source COCO JSON not found: {src}")
 
-    # Store all checkpoints inside .gitignored work/ so .pt files never enter git.
-    project_dir = Path(args.project).resolve()
-    project_dir.mkdir(parents=True, exist_ok=True)
+    data = json.loads(src.read_text(encoding="utf-8"))
+    new_anns: list[dict] = []
+    used_image_ids: set[int] = set()
+    n_person = 0
+    n_vehicle = 0
 
-    print(f"[+] Loading base weights: {args.model}")
-    print(f"[+] Training for {args.epochs} epochs at {args.imgsz}x{args.imgsz} (batch={args.batch})")
-    print(f"[+] Checkpoints saved under .gitignored directory: {project_dir / args.name}")
+    for ann in data.get("annotations", []):
+        cat_id = int(ann.get("category_id", -1))
+        if cat_id not in COCO_JSON_CAT_TO_WOG:
+            continue
+        wog_cat = COCO_JSON_CAT_TO_WOG[cat_id]
+        copied = dict(ann)
+        copied["category_id"] = wog_cat
+        new_anns.append(copied)
+        used_image_ids.add(int(ann["image_id"]))
+        if wog_cat == 1:
+            n_person += 1
+        else:
+            n_vehicle += 1
 
-    model = YOLO(args.model)
-    model.train(
-        data=str(data_path),
-        imgsz=int(args.imgsz),
-        epochs=int(args.epochs),
-        batch=int(args.batch),
-        device=args.device,
-        project=str(project_dir),
-        name=args.name,
-        exist_ok=True,
-        # Season Zero CCTV / traffic-cam robustness augmentations:
-        # keep scale jitter and lighting/color shifts strong while avoiding upside-down flips.
-        hsv_h=0.015,
-        hsv_s=0.65,
-        hsv_v=0.55,
-        degrees=12.0 if args.obb else 0.0,
-        scale=0.55,
-        fliplr=0.5,
-        flipud=0.0,
-        mosaic=0.8,
-        erasing=0.25,
-        close_mosaic=10,
+    all_images = data.get("images", [])
+    new_images = (
+        all_images
+        if keep_empty_images
+        else [img for img in all_images if int(img["id"]) in used_image_ids]
     )
 
-    best_pt = project_dir / args.name / "weights" / "best.pt"
-    obb_flag = " --obb" if args.obb else ""
-    print("\n[+] Training complete!")
-    print("[+] Next step — export & wrap into WOG [1, K, 7] ONNX (do NOT commit .pt files):")
+    out_payload = {
+        "info": data.get("info", {"description": "WOG Season Zero 2-class COCO dataset"}),
+        "licenses": data.get("licenses", []),
+        "images": new_images,
+        "annotations": new_anns,
+        "categories": [
+            {"id": 1, "name": "person", "supercategory": "person"},
+            {"id": 2, "name": "vehicle", "supercategory": "vehicle"},
+        ],
+    }
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps(out_payload), encoding="utf-8")
     print(
-        f"    python export_onnx.py --mode yolo --weights {best_pt} "
-        f"--imgsz {args.imgsz}{obb_flag} --out models/detector.onnx --update-manifest"
+        f"[+] Wrote 2-class COCO JSON -> {dst} "
+        f"(images={len(new_images)}, person={n_person}, vehicle={n_vehicle})"
     )
-    print("    python score_local.py")
-    print("    python verify_local.py")
-    print("    [LICENSE] Ultralytics-derived models MUST be submitted under AGPL-3.0.")
-    return 0
+    return {"images": len(new_images), "person": n_person, "vehicle": n_vehicle}
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Weights of Giants Season Zero training & dataset helper.")
+    ap = argparse.ArgumentParser(description="Weights of Giants Season Zero permissive dataset helper.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_prep = sub.add_parser("prepare-coco", help="Remap COCO-80 YOLO labels to WOG 2-class (person/vehicle)")
+    p_json = sub.add_parser(
+        "prepare-coco-json",
+        help="Remap COCO instances JSON -> 2-class COCO JSON (for YOLOX, NanoDet-Plus, PP-PicoDet, TorchVision)",
+    )
+    p_json.add_argument("--src-json", required=True, help="Source COCO instances_*.json")
+    p_json.add_argument("--dst-json", required=True, help="Destination 2-class COCO JSON")
+    p_json.add_argument("--keep-empty-images", action="store_true", help="Keep images with zero person/vehicle boxes")
+
+    p_prep = sub.add_parser("prepare-coco", help="Remap COCO-80 YOLO .txt labels to WOG 2-class (person/vehicle)")
     p_prep.add_argument("--src-labels", required=True, help="Source YOLO labels directory")
     p_prep.add_argument("--dst-labels", required=True, help="Destination 2-class labels directory")
     p_prep.add_argument("--images-dir", default=None, help="Optional images root for data.yaml")
     p_prep.add_argument("--out-yaml", default=None, help="Optional output data.yaml path")
 
-    p_tr = sub.add_parser("train", help="Train a lightweight YOLO / YOLO-OBB model into work/runs/")
-    p_tr.add_argument("--data", required=True, help="Path to 2-class data.yaml")
-    p_tr.add_argument("--model", default="yolo11n.pt", help="Base checkpoint (e.g. yolo11n.pt, yolo11n-obb.pt)")
-    p_tr.add_argument("--imgsz", type=int, default=320, help="Training/export resolution (recommended 320 or 416)")
-    p_tr.add_argument("--epochs", type=int, default=50, help="Training epochs")
-    p_tr.add_argument("--batch", type=int, default=32, help="Batch size")
-    p_tr.add_argument("--device", default="0", help="CUDA device id or 'cpu'")
-    p_tr.add_argument("--obb", action="store_true", help="Enable OBB rotation augmentation (for YOLO-OBB datasets)")
-    p_tr.add_argument("--project", default="work/runs", help="Output directory (keep inside .gitignored work/)")
-    p_tr.add_argument("--name", default="wog_train", help="Run folder name")
-
     args = ap.parse_args(argv)
-    if args.cmd == "prepare-coco":
-        prepare_coco_labels(
-            args.src_labels,
-            args.dst_labels,
-            images_dir=args.images_dir,
-            out_yaml=args.out_yaml,
+    if args.cmd == "prepare-coco-json":
+        prepare_coco_json(
+            args.src_json,
+            args.dst_json,
+            keep_empty_images=bool(args.keep_empty_images),
         )
         return 0
-    return run_train(args)
+
+    prepare_coco_labels(
+        args.src_labels,
+        args.dst_labels,
+        images_dir=args.images_dir,
+        out_yaml=args.out_yaml,
+    )
+    return 0
 
 
 if __name__ == "__main__":
