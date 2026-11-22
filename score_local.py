@@ -31,10 +31,10 @@ import onnxruntime as ort
 # under wog-cv-v2.1 across all 15 Season Zero clips, plus measured scores on this dev_clip.
 # (Model, Input, Size, Dev mAP, Dev HOTA, Official mAP, Official HOTA, Board FPS, RAM, Score, License)
 LA_FRITE_BASELINES = [
-    ("NanoDet-Plus-m", "320x320", "4.58 MB", "18.31%", "18.88%", "48.61%", "43.20%", "4.68 FPS", "276.5 MB", "48.48", "Apache-2.0"),
-    ("YOLOX-Nano", "416x416", "3.52 MB", "17.55%", "19.47%", "48.53%", "44.66%", "3.37 FPS", "277.6 MB", "45.00", "Apache-2.0"),
-    ("PP-PicoDet-S", "320x320", "4.56 MB", "20.48%", "19.57%", "49.04%", "43.79%", "3.26 FPS", "275.3 MB", "44.96", "Apache-2.0"),
-    ("MobileNetV3-SSD", "320x320", "13.21 MB", "3.33%", "8.13%", "28.30%", "31.73%", "3.94 FPS", "274.8 MB", "36.51*", "BSD-3-Clause"),
+    ("NanoDet-Plus-m", "320x320", "4.58 MB", "18.31%", "18.88%", "48.61%", "43.20%", "4.68 FPS", "278.6 MB", "43.56", "Apache-2.0"),
+    ("YOLOX-Nano", "416x416", "3.52 MB", "17.55%", "19.47%", "48.53%", "44.66%", "3.36 FPS", "275.7 MB", "39.27", "Apache-2.0"),
+    ("PP-PicoDet-S", "320x320", "4.56 MB", "20.48%", "19.57%", "49.04%", "43.79%", "3.24 FPS", "278.3 MB", "39.06", "Apache-2.0"),
+    ("MobileNetV3-SSD", "320x320", "13.21 MB", "3.33%", "8.13%", "28.30%", "31.73%", "3.93 FPS", "276.9 MB", "30.22*", "BSD-3-Clause"),
 ]
 
 REF_W, REF_H = 480.0, 320.0
@@ -533,7 +533,7 @@ def score_repo(repo_dir: str, clip_dir: str | None = None, save_vis: str | None 
     print(f"  {'Model':<16} {'Input':<7} {'Size':<8} {'Dev mAP':>7} {'Dev HOTA':>8} | {'Off mAP':>7} {'Off HOTA':>8} {'Board FPS':>9} {'RAM':>8} {'Score':>6} {'License'}")
     for row in LA_FRITE_BASELINES:
         print(f"  {row[0]:<16} {row[1]:<7} {row[2]:<8} {row[3]:>7} {row[4]:>8} | {row[5]:>7} {row[6]:>8} {row[7]:>9} {row[8]:>8} {row[9]:>6} {row[10]}")
-    print("  * MobileNetV3-SSD failed rural eligibility gates (rural mAP 17.4 < 25, HOTA 21.2 < 30, domain 28.2 < 35).")
+    print("  * MobileNetV3-SSD passed Indoor (40.8) but failed Urban (domain 28.7 < 35) and Rural (mAP 17.4 < 25, HOTA 21.2 < 30, domain 21.2 < 35).")
     print("-" * 92)
     if map_50_95 < 10.0 or hota_res["hota"] < 12.0:
         print("  [!] Low dev-clip accuracy compared to passing Season Zero baselines (~17–19% mAP / ~18–19% HOTA here).")

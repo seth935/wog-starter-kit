@@ -43,12 +43,12 @@ Desktop CPUs are typically **50×–200× faster** than the `1.2 GHz` quad-core 
 
 | Reference Baseline | Input | ONNX Size | `dev_clip` mAP / HOTA | Official 15-Clip mAP | Official HOTA | Measured La Frite FPS | Peak RAM | Generalist Score | License |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| **NanoDet-Plus-m** | 320×320 | 4.58 MB | 18.31% / 18.88% | 48.61% | 43.20% | **4.68 FPS** | 276.5 MB | **48.48** | Apache-2.0 |
-| **YOLOX-Nano** | 416×416 | 3.52 MB | 17.55% / 19.47% | 48.53% | 44.66% | **3.37 FPS** | 277.6 MB | **45.00** | Apache-2.0 |
-| **PP-PicoDet-S** | 320×320 | 4.56 MB | 20.48% / 19.57% | 49.04% | 43.79% | **3.26 FPS** | 275.3 MB | **44.96** | Apache-2.0 |
-| **MobileNetV3-SSD** | 320×320 | 13.21 MB | 3.33% / 8.13% | 28.30% | 31.73% | **3.94 FPS** | 274.8 MB | 36.51\* | BSD-3-Clause |
+| **NanoDet-Plus-m** | 320×320 | 4.58 MB | 18.31% / 18.88% | 48.61% | 43.20% | **4.68 FPS** | 278.6 MB | **43.56** | Apache-2.0 |
+| **YOLOX-Nano** | 416×416 | 3.52 MB | 17.55% / 19.47% | 48.53% | 44.66% | **3.36 FPS** | 275.7 MB | **39.27** | Apache-2.0 |
+| **PP-PicoDet-S** | 320×320 | 4.56 MB | 20.48% / 19.57% | 49.04% | 43.79% | **3.24 FPS** | 278.3 MB | **39.06** | Apache-2.0 |
+| **MobileNetV3-SSD** | 320×320 | 13.21 MB | 3.33% / 8.13% | 28.30% | 31.73% | **3.93 FPS** | 276.9 MB | 30.22\* | BSD-3-Clause |
 
-\* *MobileNetV3-SSD passed Indoor (46.3) and Urban (35.0) but failed Rural eligibility gates (rural mAP 17.4 < 25, HOTA 21.2 < 30, domain score 28.2 < 35).*
+\* *MobileNetV3-SSD passed Indoor (40.8) but failed Urban (domain score 28.7 < 35) and Rural eligibility gates (rural mAP 17.4 < 25, HOTA 21.2 < 30, domain score 21.2 < 35).*
 
 ---
 
@@ -113,7 +113,7 @@ python train.py prepare-coco \
 
 ### Step 3 — Train or Choose a Permissive Base Detector
 Keep raw checkpoints inside `.gitignore`d `work/` so `.pt` / `.pth` / `.pkl` files never enter git:
-* **YOLOX-Nano / YOLOX-Tiny (`Apache-2.0`):** [Megvii-BaseDetection/YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) — fast anchor-free detector (`3.52 MB`, `3.37 FPS` @ 416×416 on La Frite).
+* **YOLOX-Nano / YOLOX-Tiny (`Apache-2.0`):** [Megvii-BaseDetection/YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) — fast anchor-free detector (`3.52 MB`, `3.36 FPS` @ 416×416 on La Frite).
 * **NanoDet-Plus (`Apache-2.0`):** [RangiLyu/nanodet](https://github.com/RangiLyu/nanodet) — top reference generalist (`4.58 MB`, `4.68 FPS` @ 320×320 on La Frite).
 * **PP-PicoDet-S (`Apache-2.0`):** [PaddlePaddle/PaddleDetection](https://github.com/PaddlePaddle/PaddleDetection) — highest baseline mAP (`4.56 MB`, `49.04% mAP` @ 320×320 on La Frite).
 * **Custom PyTorch / TorchVision (`BSD-3-Clause` / `MIT` / `Apache-2.0`):** Train any lightweight MobileNet / GhostNet / ShuffleNet / ConvNeXt-Nano backbone and export to ONNX (`opset <= 22`, `IR <= 10`).

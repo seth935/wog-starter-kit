@@ -519,10 +519,10 @@ def verify_repo(repo_dir: str = ".", image_path: str | None = None, save_preview
                 break
 
     print("\nMeasured La Frite Cortex-A53 Reference Speeds (for sizing your model vs. 2.4 FPS floor):")
-    print("  NanoDet-Plus-m  (320x320,  4.58 MB): 4.68 FPS · 276.5 MB RAM · 48.61% mAP · 43.20% HOTA")
-    print("  MobileNetV3-SSD (320x320, 13.21 MB): 3.94 FPS · 274.8 MB RAM · 28.30% mAP · 31.73% HOTA")
-    print("  YOLOX-Nano      (416x416,  3.52 MB): 3.37 FPS · 277.6 MB RAM · 48.53% mAP · 44.66% HOTA")
-    print("  PP-PicoDet-S    (320x320,  4.56 MB): 3.26 FPS · 275.3 MB RAM · 49.04% mAP · 43.79% HOTA")
+    print("  NanoDet-Plus-m  (320x320,  4.58 MB): 4.68 FPS · 278.6 MB RAM · 48.61% mAP · 43.20% HOTA")
+    print("  MobileNetV3-SSD (320x320, 13.21 MB): 3.93 FPS · 276.9 MB RAM · 28.30% mAP · 31.73% HOTA")
+    print("  YOLOX-Nano      (416x416,  3.52 MB): 3.36 FPS · 275.7 MB RAM · 48.53% mAP · 44.66% HOTA")
+    print("  PP-PicoDet-S    (320x320,  4.56 MB): 3.24 FPS · 278.3 MB RAM · 49.04% mAP · 43.79% HOTA")
 
     if fps < CORTEX_A53_PROFILE["limits"]["fps_floor"]:
         failures.append(f"Host FPS {fps:.1f} is already below the {CORTEX_A53_PROFILE['limits']['fps_floor']} FPS floor.")
