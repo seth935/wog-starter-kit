@@ -48,6 +48,15 @@ def _build_dummy_raw_yolo_onnx(path: Path, raw_arr: np.ndarray, imgsz: int = 320
     onnx.save(model, str(path))
 
 
+def _make_nonzero_wrapped_detector(out_path: Path, raw_p: Path, imgsz: int = 320) -> None:
+    raw = np.zeros((1, 6, 4), dtype=np.float32)
+    raw[0, 0:4, 0] = [160.0, 160.0, 64.0, 96.0]
+    raw[0, 4, 0] = 0.85
+    raw[0, 5, 0] = 0.05
+    _build_dummy_raw_yolo_onnx(raw_p, raw, imgsz=imgsz, opset=17)
+    export_onnx.wrap_yolo_onnx(raw_p, out_path, imgsz=imgsz, num_classes=2, top_k=4)
+
+
 class TestStarterKit(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="wog_starter_test_"))
@@ -129,8 +138,33 @@ class TestStarterKit(unittest.TestCase):
         # Anchor 1 (dog) must have 0.0 confidence after COCO remap
         self.assertLess(float(dets[0, 2, 5]), 1e-4)
 
-    def test_verify_local_passes_on_starter_kit(self) -> None:
-        self.assertTrue(verify_local.verify_repo(str(STARTER_DIR)))
+    def test_verify_local_rejects_bundled_stub_and_passes_real_detector(self) -> None:
+        # Bundled schema stub must be rejected so new users do not waste a Run Token on a 0% model
+        self.assertFalse(verify_local.verify_repo(str(STARTER_DIR)))
+
+        repo = self.tmp / "real_repo"
+        (repo / "models").mkdir(parents=True)
+        shutil.copy(STARTER_DIR / "model.json", repo / "model.json")
+        shutil.copy(STARTER_DIR / "LICENSE", repo / "LICENSE")
+        shutil.copytree(STARTER_DIR / "dev_clip", repo / "dev_clip")
+        _make_nonzero_wrapped_detector(repo / "models" / "detector_int8.onnx", self.tmp / "raw_ok.onnx")
+        self.assertTrue(verify_local.verify_repo(str(repo)))
+
+    def test_verify_local_rejects_zero_detection_model_on_real_frame(self) -> None:
+        # Non-stub graph name, yet confidence is always < conf_threshold -> 0 detections on dev_clip
+        raw = np.zeros((1, 6, 4), dtype=np.float32)
+        raw[0, 0:4, 0] = [160.0, 160.0, 64.0, 96.0]
+        raw[0, 4, 0] = 0.05  # below conf_threshold=0.35
+        raw_p = self.tmp / "raw_low.onnx"
+        _build_dummy_raw_yolo_onnx(raw_p, raw, imgsz=320, opset=17)
+
+        repo = self.tmp / "low_repo"
+        (repo / "models").mkdir(parents=True)
+        shutil.copy(STARTER_DIR / "model.json", repo / "model.json")
+        shutil.copy(STARTER_DIR / "LICENSE", repo / "LICENSE")
+        shutil.copytree(STARTER_DIR / "dev_clip", repo / "dev_clip")
+        export_onnx.wrap_yolo_onnx(raw_p, repo / "models" / "detector_int8.onnx", imgsz=320, num_classes=2, top_k=4)
+        self.assertFalse(verify_local.verify_repo(str(repo)))
 
     def test_verify_local_catches_bad_values_and_pt_files(self) -> None:
         # Pixel coordinates should fail
@@ -262,13 +296,90 @@ class TestStarterKit(unittest.TestCase):
         repo = self.tmp / "lic_repo"
         (repo / "models").mkdir(parents=True)
         shutil.copy(STARTER_DIR / "model.json", repo / "model.json")
-        shutil.copy(STARTER_DIR / "models" / "detector_int8.onnx", repo / "models" / "detector_int8.onnx")
+        _make_nonzero_wrapped_detector(repo / "models" / "detector_int8.onnx", self.tmp / "raw_lic.onnx")
 
         (repo / "LICENSE").write_text("GNU AFFERO GENERAL PUBLIC LICENSE\nVersion 3\n", encoding="utf-8")
         self.assertFalse(verify_local.verify_repo(str(repo)))
 
         (repo / "LICENSE").write_text("Apache License\nVersion 2.0, January 2004\n", encoding="utf-8")
         self.assertTrue(verify_local.verify_repo(str(repo)))
+
+    def test_wrap_yolox_bakes_bgr255_preprocess_and_grid_decode(self) -> None:
+        # 416x416 undecoded YOLOX has N = 52*52 + 26*26 + 13*13 = 3549 anchors
+        # Anchor 0 is stride=8, grid=(0, 0). Anchor index 2704 (= 52*52) is stride=16, grid=(0, 0).
+        inp = helper.make_tensor_value_info("images", TensorProto.FLOAT, [1, 3, 416, 416])
+        out = helper.make_tensor_value_info("output0", TensorProto.FLOAT, [1, 3549, 85])
+
+        # Compute mean of inner input[0, :, :, :] -> [1, 3] representing BGR [0..255] if wrapped with bgr255
+        # Use channel 0 (B -> must become 204.0 when R=0.2, G=0.5, B=0.8) / 204.0 to gate objectness!
+        base = np.zeros((1, 3549, 85), dtype=np.float32)
+        # Put undecoded offsets on anchor 0 (stride=8, grid=(0,0)), strictly inside [0, 416] so no edge clamp triggers:
+        # tx=10.0, ty=10.0 -> cx_px = (10+0)*8 = 80.0, cy_px = (10+0)*8 = 80.0
+        # tw=ln(4), th=ln(8) -> w_px = 4*8 = 32.0, h_px = 8*8 = 64.0
+        base[0, 0, 0:4] = [10.0, 10.0, math.log(4.0), math.log(8.0)]
+        base[0, 0, 4] = 1.0  # will be scaled by (ch0 / 204.0) * 0.90
+        base[0, 0, 5 + 2] = 0.90  # car -> vehicle=1
+
+        ch0_starts = numpy_helper.from_array(np.array([0], dtype=np.int64), name="s0")
+        ch0_ends = numpy_helper.from_array(np.array([1], dtype=np.int64), name="e1")
+        ch0_axes = numpy_helper.from_array(np.array([1], dtype=np.int64), name="a1")
+        ch0_div = numpy_helper.from_array(np.array([255.0], dtype=np.float32), name="d255")
+        base_t = numpy_helper.from_array(base, name="base_arr")
+        sh_t = numpy_helper.from_array(np.array([1, 1, 1], dtype=np.int64), name="sh111")
+
+        # Anchor 0 confidence directly mirrors inner channel 0 mean / 255.0:
+        # for RGB (0.2, 0.5, 0.8), BGR*255 gives inner ch0 = 0.8*255 = 204 -> gate = 0.80 -> conf = 0.80*0.90 = 0.72!
+        s_box_s = numpy_helper.from_array(np.array([0], dtype=np.int64), name="bs0")
+        s_box_e = numpy_helper.from_array(np.array([4], dtype=np.int64), name="be4")
+        s_rest_e = numpy_helper.from_array(np.array([85], dtype=np.int64), name="re85")
+        ax2 = numpy_helper.from_array(np.array([2], dtype=np.int64), name="ax2")
+        nodes = [
+            helper.make_node("Slice", ["images", "s0", "e1", "a1"], ["ch0"]),
+            helper.make_node("ReduceMean", ["ch0"], ["m0"], keepdims=0),
+            helper.make_node("Reshape", ["m0", "sh111"], ["m3d"]),
+            helper.make_node("Div", ["m3d", "d255"], ["gate"]),
+            helper.make_node("Slice", ["base_arr", "bs0", "be4", "ax2"], ["b_coords"]),
+            helper.make_node("Slice", ["base_arr", "be4", "re85", "ax2"], ["b_scores"]),
+            helper.make_node("Mul", ["b_scores", "gate"], ["g_scores"]),
+            helper.make_node("Concat", ["b_coords", "g_scores"], ["output0"], axis=2),
+        ]
+        graph = helper.make_graph(
+            nodes,
+            "yolox_raw_undecoded",
+            [inp],
+            [out],
+            initializer=[ch0_starts, ch0_ends, ch0_axes, ch0_div, base_t, sh_t, s_box_s, s_box_e, s_rest_e, ax2],
+        )
+        raw_model = helper.make_model(graph, ir_version=8, opset_imports=[helper.make_opsetid("", 17)])
+        raw_p = self.tmp / "raw_yolox_3549.onnx"
+        out_p = self.tmp / "wrapped_yolox_3549.onnx"
+        onnx.save(raw_model, str(raw_p))
+
+        export_onnx.wrap_yolox_onnx(raw_p, out_p, imgsz=416, coco_remap=True, top_k=4)
+        sess = ort.InferenceSession(str(out_p), providers=["CPUExecutionProvider"])
+        rgb = np.empty((1, 3, 416, 416), dtype=np.float32)
+        rgb[:, 0] = 0.2  # R
+        rgb[:, 1] = 0.5  # G
+        rgb[:, 2] = 0.8  # B -> inner ch0 must become 0.8 * 255 = 204
+        dets = sess.run(None, {"images": rgb})[0]
+        self.assertEqual(dets.shape, (1, 4, 7))
+        # Box normalized to [416, 416]: cx=80/416, cy=80/416, w=32/416, h=64/416
+        np.testing.assert_allclose(
+            dets[0, 0, :4],
+            [80.0 / 416.0, 80.0 / 416.0, 32.0 / 416.0, 64.0 / 416.0],
+            atol=1e-4,
+        )
+        # Dummy graph multiplies both obj_conf (1.0) and cls_2 (0.90) by gate=(B*255)/255=0.8,
+        # and YOLOX computes conf = obj_conf * cls_prob = (0.8) * (0.90 * 0.8) = 0.576.
+        self.assertAlmostEqual(float(dets[0, 0, 5]), 0.8 * 0.8 * 0.90, places=4)
+        self.assertEqual(int(round(float(dets[0, 0, 6]))), 1)
+
+        # Flip B to 0.2 -> inner ch0 drops from 204 to 51, dropping conf to 0.2 * 0.2 * 0.90 = 0.036
+        rgb_low_b = rgb.copy()
+        rgb_low_b[:, 0] = 0.8
+        rgb_low_b[:, 2] = 0.2
+        dets_low_b = sess.run(None, {"images": rgb_low_b})[0]
+        self.assertAlmostEqual(float(dets_low_b[0, 0, 5]), 0.2 * 0.2 * 0.90, places=4)
 
 
 if __name__ == "__main__":

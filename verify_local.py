@@ -174,7 +174,7 @@ def _obb_iou_nms(a: dict, b: dict) -> float:
     return float(max(0.0, min(1.0, inter / union))) if union > 1e-9 else 0.0
 
 
-def _decode_and_draw_preview(
+def _infer_and_decode_image(
     image_path: str,
     session: ort.InferenceSession,
     input_name: str,
@@ -183,7 +183,7 @@ def _decode_and_draw_preview(
     conf_thr: float,
     nms_iou: float = 0.45,
     save_preview: str | None = None,
-) -> list[dict]:
+) -> tuple[np.ndarray, list[dict]]:
     import cv2
 
     bgr = cv2.imread(image_path)
@@ -255,7 +255,45 @@ def _decode_and_draw_preview(
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
         cv2.imwrite(save_preview, vis)
         print(f"[+] Saved post-NMS OBB preview to: {save_preview}")
+    return np.asarray(out), kept
+
+
+def _decode_and_draw_preview(
+    image_path: str,
+    session: ort.InferenceSession,
+    input_name: str,
+    wh: tuple[int, int],
+    resize_mode: str,
+    conf_thr: float,
+    nms_iou: float = 0.45,
+    save_preview: str | None = None,
+) -> list[dict]:
+    _, kept = _infer_and_decode_image(
+        image_path,
+        session,
+        input_name,
+        wh,
+        resize_mode,
+        conf_thr,
+        nms_iou=nms_iou,
+        save_preview=save_preview,
+    )
     return kept
+
+
+def _sample_dev_clip_frames(root: Path) -> list[Path]:
+    frames_dir = root / "dev_clip" / "frames"
+    if not frames_dir.is_dir():
+        return []
+    preferred = [frames_dir / name for name in ("frame_0000.jpg", "frame_0012.jpg", "frame_0024.jpg")]
+    if all(p.is_file() for p in preferred):
+        return preferred
+    all_imgs = sorted(
+        p for p in frames_dir.iterdir() if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png")
+    )
+    if len(all_imgs) <= 3:
+        return all_imgs
+    return [all_imgs[0], all_imgs[len(all_imgs) // 2], all_imgs[-1]]
 
 
 def verify_repo(repo_dir: str = ".", image_path: str | None = None, save_preview: str | None = None) -> bool:
@@ -413,11 +451,18 @@ def verify_repo(repo_dir: str = ".", image_path: str | None = None, save_preview
             "verify your model stays above the 2.4 FPS floor (320x320 or 416x416 is recommended)."
         )
 
-    # Optional ONNX IR/opset check (install `onnx` locally for full parity)
+    # Optional ONNX IR/opset + stub-graph check (install `onnx` locally for full parity)
+    onnx_graph_name: str | None = None
     try:
         import onnx
 
         onnx_model = onnx.load(str(model_path), load_external_data=False)
+        onnx_graph_name = str(getattr(getattr(onnx_model, "graph", None), "name", "") or "")
+        if onnx_graph_name == "wog_cortex_a53_schema_stub":
+            failures.append(
+                "Model is the bundled untrained all-zeros placeholder stub (0.0% mAP). "
+                "Replace models/detector_int8.onnx with a real detector before submitting so you do not spend a Run Token on a 0% model."
+            )
         ir_ver = int(getattr(onnx_model, "ir_version", 0) or 0)
         if ir_ver <= 0 or ir_ver > CORTEX_A53_PROFILE["limits"]["max_onnx_ir"]:
             failures.append(
@@ -471,20 +516,54 @@ def verify_repo(repo_dir: str = ".", image_path: str | None = None, save_preview
     val_fail, val_warn = _validate_output_values(detections)
     failures.extend(val_fail)
     warnings.extend(val_warn)
-    if not val_fail:
+
+    pattern_input = np.zeros((1, 3, input_h, input_w), dtype=np.float32)
+    pattern_input[:, :, input_h // 4 : (3 * input_h) // 4, input_w // 4 : (3 * input_w) // 4] = 1.0
+    pattern_det = session.run(None, {input_meta.name: pattern_input})[0]
+    if float(np.max(np.abs(detections))) == 0.0 and float(np.max(np.abs(pattern_det))) == 0.0:
+        failures.append(
+            "Model outputs all zeros on every test input (0 detections / 0.0% mAP). "
+            "Replace the bundled placeholder or verify your ONNX export and preprocessing before submitting."
+        )
+    elif not val_fail:
         print("  Contract Output Format: VALID ([cx, cy, w, h, theta_rad, conf, cls, ...])")
 
-    if image_path:
-        _decode_and_draw_preview(
-            image_path,
-            session,
-            input_meta.name,
-            (input_w, input_h),
-            resize_mode,
-            float(conf_thr),
-            nms_iou=float(iou_thr),
-            save_preview=save_preview,
-        )
+    sample_frames: list[Path] = [Path(image_path)] if image_path else _sample_dev_clip_frames(root)
+    if sample_frames:
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            if image_path:
+                failures.append("opencv-python is required when running --image verification.")
+            else:
+                warnings.append("Package 'opencv-python' not installed locally; skipping dev_clip real-image detection check.")
+        else:
+            total_real_dets = 0
+            for idx_img, img_p in enumerate(sample_frames):
+                raw_out, kept = _infer_and_decode_image(
+                    str(img_p),
+                    session,
+                    input_meta.name,
+                    (input_w, input_h),
+                    resize_mode,
+                    float(conf_thr),
+                    nms_iou=float(iou_thr),
+                    save_preview=save_preview if (image_path or idx_img == 0) else None,
+                )
+                rf_fail, _rf_warn = _validate_output_values(raw_out)
+                for msg in rf_fail:
+                    if msg not in failures:
+                        failures.append(msg)
+                total_real_dets += len(kept)
+            if total_real_dets == 0:
+                failures.append(
+                    f"Model produced 0 detections (conf >= {conf_thr}) on {len(sample_frames)} real sample image(s). "
+                    "A model that detects nothing locally will score 0% and waste a Run Token. "
+                    "Common causes: bundled placeholder stub still present, missing YOLOX [8,16,32] grid decoding, "
+                    "or RGB [0,1] vs BGR [0,255] input preprocessing mismatch."
+                )
+    else:
+        warnings.append("No --image or dev_clip/frames found; skipping real-image detection check.")
 
     # Check for permissive open-source LICENSE file (reject copyleft/non-commercial locally)
     license_file = next(

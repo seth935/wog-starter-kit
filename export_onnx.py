@@ -19,12 +19,13 @@ Wraps a raw detection ONNX into the exact La Frite ONNX Runtime contract:
 
 Supported input head layouts:
   1. --mode wrap-yolox  Apache-2.0 Megvii YOLOX raw ONNX [1, N, 5+C]
-                        ([cx, cy, w, h, obj_conf, cls_0..cls_{C-1}], conf = obj_conf * cls_prob)
+                        ([cx, cy, w, h, obj_conf, cls_0..cls_{C-1}], conf = obj_conf * cls_prob;
+                        automatically bakes RGB [0,1] -> BGR [0,255] + [8,16,32] grid decoding)
   2. --mode wrap-onnx   Channel-first anchor-free raw ONNX [1, 4+C, N] (AABB) or [1, 5+C, N] (OBB)
 
 Examples:
-    # 1. Wrap a pretrained 80-class Apache-2.0 YOLOX-Nano ONNX (auto-remaps COCO -> person/vehicle)
-    python export_onnx.py --mode wrap-yolox --onnx work/yolox_nano.onnx --imgsz 416 --coco-remap --quantize int8 --out models/detector_int8.onnx --update-manifest
+    # 1. Wrap official Apache-2.0 YOLOX-Nano ONNX (auto-remaps COCO + bakes BGRx255 & grid decode):
+    python export_onnx.py --mode wrap-yolox --onnx work/yolox_nano.onnx --imgsz 416 --coco-remap --out models/detector.onnx --update-manifest
 
     # 2. Wrap a custom 2-class YOLOX ONNX
     python export_onnx.py --mode wrap-yolox --onnx work/yolox_2class.onnx --imgsz 320 --num-classes 2 --out models/detector.onnx --update-manifest
@@ -57,6 +58,70 @@ def _get_main_opset(model: onnx.ModelProto) -> int:
         if imp.domain in ("", "ai.onnx"):
             return int(imp.version)
     return 17
+
+
+INPUT_FORMATS = ("rgb01", "bgr01", "rgb255", "bgr255")
+
+
+def _prepend_input_preprocess(model: onnx.ModelProto, input_format: str, prefix: str) -> None:
+    """Convert La Frite `images` (RGB [0, 1]) into the inner model's expected channel order/scale."""
+    if input_format not in INPUT_FORMATS:
+        raise ValueError(f"Unsupported input_format={input_format!r}; choose one of {INPUT_FORMATS}.")
+    if input_format == "rgb01":
+        return
+
+    graph = model.graph
+    if not graph.input:
+        raise ValueError("ONNX model has no graph inputs.")
+    orig_inp = graph.input[0]
+    orig_name = orig_inp.name
+    target_name = f"{prefix}pre_target_{orig_name}"
+
+    for node in graph.node:
+        for idx, inp_name in enumerate(node.input):
+            if inp_name == orig_name:
+                node.input[idx] = target_name
+
+    orig_inp.name = "images"
+    pre_inits: list[onnx.TensorProto] = []
+    pre_nodes: list[onnx.NodeProto] = []
+    cur_name = "images"
+
+    if input_format.startswith("bgr"):
+        perm_t = f"{prefix}bgr_perm"
+        pre_inits.append(numpy_helper.from_array(np.array([2, 1, 0], dtype=np.int64), name=perm_t))
+        next_name = target_name if input_format == "bgr01" else f"{prefix}bgr_01"
+        pre_nodes.append(helper.make_node("Gather", [cur_name, perm_t], [next_name], axis=1))
+        cur_name = next_name
+
+    if input_format.endswith("255"):
+        scale_t = f"{prefix}scale_255"
+        pre_inits.append(numpy_helper.from_array(np.array(255.0, dtype=np.float32), name=scale_t))
+        pre_nodes.append(helper.make_node("Mul", [cur_name, scale_t], [target_name]))
+
+    existing_nodes = list(graph.node)
+    del graph.node[:]
+    graph.node.extend(pre_nodes)
+    graph.node.extend(existing_nodes)
+    graph.initializer.extend(pre_inits)
+
+
+def _has_tail_exp_node(model: onnx.ModelProto, lookback: int = 35) -> bool:
+    return any(n.op_type == "Exp" for n in model.graph.node[-lookback:])
+
+
+def _build_yolox_grids_strides(
+    in_h: int, in_w: int, strides: tuple[int, ...] = (8, 16, 32)
+) -> tuple[np.ndarray, np.ndarray]:
+    grids_list: list[np.ndarray] = []
+    strides_list: list[np.ndarray] = []
+    for stride in strides:
+        gh, gw = in_h // stride, in_w // stride
+        xv, yv = np.meshgrid(np.arange(gw, dtype=np.float32), np.arange(gh, dtype=np.float32), indexing="xy")
+        grid = np.stack((xv, yv), axis=2).reshape(1, -1, 2)
+        grids_list.append(grid)
+        strides_list.append(np.full((1, grid.shape[1], 1), float(stride), dtype=np.float32))
+    return np.concatenate(grids_list, axis=1), np.concatenate(strides_list, axis=1)
 
 
 def _infer_3d_dims(model: onnx.ModelProto, imgsz: int) -> tuple[int, int, int, int]:
@@ -251,6 +316,7 @@ def wrap_yolo_onnx(
     top_k: int = 200,
     already_normalized: bool = False,
     quantize: str = "none",
+    input_format: str = "rgb01",
 ) -> Path:
     """Append an in-graph WOG [1, K, 7] head to a channel-first [1, 4+C, N] or [1, 5+C, N] ONNX."""
     model = onnx.load(str(raw_onnx_path))
@@ -295,6 +361,7 @@ def wrap_yolo_onnx(
     k_val = max(1, min(int(top_k), raw_n))
     raw_out_name = model.graph.output[0].name
     p = "__wog_wrap_"
+    _prepend_input_preprocess(model, input_format, p)
     inits, nodes, add_init, make_slice, make_reduce_max, make_squeeze = _make_graph_helpers(opset, p)
 
     raw_t = p + "raw_t"
@@ -350,6 +417,8 @@ def wrap_yolox_onnx(
     top_k: int = 200,
     already_normalized: bool = False,
     quantize: str = "none",
+    input_format: str = "bgr255",
+    decode_yolox: str | bool = "auto",
 ) -> Path:
     """Append an in-graph WOG [1, K, 7] head to an Apache-2.0 YOLOX [1, N, 5+C] ONNX."""
     model = onnx.load(str(raw_onnx_path))
@@ -378,15 +447,96 @@ def wrap_yolox_onnx(
     k_val = max(1, min(int(top_k), raw_n))
     raw_out_name = model.graph.output[0].name
     p = "__wog_yolox_"
+    _prepend_input_preprocess(model, input_format, p)
     inits, nodes, add_init, make_slice, make_reduce_max, make_squeeze = _make_graph_helpers(opset, p)
 
-    boxes_raw = make_slice(raw_out_name, 0, 4, 2, "boxes_raw")
-    if already_normalized:
-        boxes_norm = boxes_raw
+    expected_n = sum((in_h // s) * (in_w // s) for s in (8, 16, 32)) if (in_h % 32 == 0 and in_w % 32 == 0) else -1
+    if isinstance(decode_yolox, bool):
+        if decode_yolox and raw_n != expected_n:
+            raise ValueError(f"--decode-yolox requires N={expected_n} anchors for {in_w}x{in_h}, got {raw_n}.")
+        do_decode = decode_yolox
     else:
-        scale = add_init("wh_scale", np.array([float(in_w), float(in_h), float(in_w), float(in_h)], dtype=np.float32))
+        mode_dec = str(decode_yolox).lower()
+        if mode_dec == "true":
+            if raw_n != expected_n:
+                raise ValueError(f"--decode-yolox requires N={expected_n} anchors for {in_w}x{in_h}, got {raw_n}.")
+            do_decode = True
+        elif mode_dec == "false":
+            do_decode = False
+        else:
+            do_decode = raw_n == expected_n and not _has_tail_exp_node(model)
+
+    if do_decode:
+        grids_arr, strides_arr = _build_yolox_grids_strides(in_h, in_w)
+        grids_t = add_init("grids", grids_arr)
+        strides_t = add_init("strides", strides_arr)
+        half_t = add_init("half", np.array(0.5, dtype=np.float32))
+        zero_t = add_init("zero_f", np.array(0.0, dtype=np.float32))
+        max_w_t = add_init("max_w", np.array(float(in_w), dtype=np.float32))
+        max_h_t = add_init("max_h", np.array(float(in_h), dtype=np.float32))
+
+        raw_xy = make_slice(raw_out_name, 0, 2, 2, "raw_xy")
+        raw_wh = make_slice(raw_out_name, 2, 4, 2, "raw_wh")
+
+        xy_g = p + "xy_g"
+        cxy = p + "cxy"
+        wh_e = p + "wh_e"
+        wh_px = p + "wh_px"
+        half_wh = p + "half_wh"
+        x1y1 = p + "x1y1"
+        x2y2 = p + "x2y2"
+        nodes.append(helper.make_node("Add", [raw_xy, grids_t], [xy_g]))
+        nodes.append(helper.make_node("Mul", [xy_g, strides_t], [cxy]))
+        nodes.append(helper.make_node("Exp", [raw_wh], [wh_e]))
+        nodes.append(helper.make_node("Mul", [wh_e, strides_t], [wh_px]))
+        nodes.append(helper.make_node("Mul", [wh_px, half_t], [half_wh]))
+        nodes.append(helper.make_node("Sub", [cxy, half_wh], [x1y1]))
+        nodes.append(helper.make_node("Add", [cxy, half_wh], [x2y2]))
+
+        x1_raw = make_slice(x1y1, 0, 1, 2, "x1_raw")
+        y1_raw = make_slice(x1y1, 1, 2, 2, "y1_raw")
+        x2_raw = make_slice(x2y2, 0, 1, 2, "x2_raw")
+        y2_raw = make_slice(x2y2, 1, 2, 2, "y2_raw")
+
+        def clamp_0_max(src: str, max_t: str, tag: str) -> str:
+            hi_floored = p + tag + "_ge0"
+            clamped = p + tag
+            nodes.append(helper.make_node("Max", [src, zero_t], [hi_floored]))
+            nodes.append(helper.make_node("Min", [hi_floored, max_t], [clamped]))
+            return clamped
+
+        x1 = clamp_0_max(x1_raw, max_w_t, "x1")
+        x2 = clamp_0_max(x2_raw, max_w_t, "x2")
+        y1 = clamp_0_max(y1_raw, max_h_t, "y1")
+        y2 = clamp_0_max(y2_raw, max_h_t, "y2")
+
+        xsum, cx_px, cx = p + "xsum", p + "cx_px", p + "cx"
+        ysum, cy_px, cy = p + "ysum", p + "cy_px", p + "cy"
+        bw_px, bw = p + "bw_px", p + "bw"
+        bh_px, bh = p + "bh_px", p + "bh"
+        nodes.append(helper.make_node("Add", [x1, x2], [xsum]))
+        nodes.append(helper.make_node("Mul", [xsum, half_t], [cx_px]))
+        nodes.append(helper.make_node("Div", [cx_px, max_w_t], [cx]))
+        nodes.append(helper.make_node("Add", [y1, y2], [ysum]))
+        nodes.append(helper.make_node("Mul", [ysum, half_t], [cy_px]))
+        nodes.append(helper.make_node("Div", [cy_px, max_h_t], [cy]))
+        nodes.append(helper.make_node("Sub", [x2, x1], [bw_px]))
+        nodes.append(helper.make_node("Div", [bw_px, max_w_t], [bw]))
+        nodes.append(helper.make_node("Sub", [y2, y1], [bh_px]))
+        nodes.append(helper.make_node("Div", [bh_px, max_h_t], [bh]))
+
         boxes_norm = p + "boxes_norm"
-        nodes.append(helper.make_node("Div", [boxes_raw, scale], [boxes_norm]))
+        nodes.append(helper.make_node("Concat", [cx, cy, bw, bh], [boxes_norm], axis=2))
+        print(f"    YOLOX decode: baked RGB[0,1]->{input_format} + [8,16,32] grid decode ({raw_n} anchors)")
+    else:
+        boxes_raw = make_slice(raw_out_name, 0, 4, 2, "boxes_raw")
+        if already_normalized:
+            boxes_norm = boxes_raw
+        else:
+            scale = add_init("wh_scale", np.array([float(in_w), float(in_h), float(in_w), float(in_h)], dtype=np.float32))
+            boxes_norm = p + "boxes_norm"
+            nodes.append(helper.make_node("Div", [boxes_raw, scale], [boxes_norm]))
+        print(f"    YOLOX preprocess: baked RGB[0,1]->{input_format} (grid decode skipped; N={raw_n})")
 
     # YOLOX final class confidence = obj_conf * cls_prob
     obj_conf = make_slice(raw_out_name, 4, 5, 2, "obj_conf")
@@ -453,6 +603,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top-k", type=int, default=200, help="Top-K detections kept in-graph (default 200)")
     ap.add_argument("--already-normalized", action="store_true", help="Set if raw boxes are already in [0, 1]")
     ap.add_argument("--quantize", choices=("none", "int8"), default="none", help="Optional dynamic INT8 quantization")
+    ap.add_argument(
+        "--input-format",
+        choices=INPUT_FORMATS,
+        default=None,
+        help="Inner ONNX expected input format before wrapping (default: bgr255 for wrap-yolox, rgb01 for wrap-onnx)",
+    )
+    dec_grp = ap.add_mutually_exclusive_group()
+    dec_grp.add_argument("--decode-yolox", dest="decode_yolox", action="store_const", const="true",
+                         help="Force YOLOX [8,16,32] grid decoding inside ONNX")
+    dec_grp.add_argument("--no-decode-yolox", dest="decode_yolox", action="store_const", const="false",
+                         help="Disable YOLOX grid decoding (when ONNX already exported decoded)")
+    ap.set_defaults(decode_yolox="auto")
     ap.add_argument("--out", default="models/detector.onnx", help="Output .onnx path inside repo")
     ap.add_argument("--update-manifest", action="store_true", help="Update model.json detector path & input_size")
     args = ap.parse_args(argv)
@@ -462,6 +624,7 @@ def main(argv: list[str] | None = None) -> int:
 
     raw_path = Path(args.onnx).resolve()
     if args.mode == "wrap-yolox":
+        fmt = args.input_format or "bgr255"
         out_path = wrap_yolox_onnx(
             raw_path,
             args.out,
@@ -471,8 +634,11 @@ def main(argv: list[str] | None = None) -> int:
             top_k=args.top_k,
             already_normalized=args.already_normalized,
             quantize=args.quantize,
+            input_format=fmt,
+            decode_yolox=args.decode_yolox,
         )
     else:
+        fmt = args.input_format or "rgb01"
         out_path = wrap_yolo_onnx(
             raw_path,
             args.out,
@@ -483,6 +649,7 @@ def main(argv: list[str] | None = None) -> int:
             top_k=args.top_k,
             already_normalized=args.already_normalized,
             quantize=args.quantize,
+            input_format=fmt,
         )
 
     if args.update_manifest:
